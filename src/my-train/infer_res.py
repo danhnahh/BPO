@@ -6,7 +6,13 @@ from config import MODEL_CACHE_PATH
 
 device = 'cuda:0'
 model_name = "lmsys/vicuna-7b-v1.3"
-prompt_template = "[INST] {} [/INST]"
+prompt_template = """[INST]
+You are a helpful and concise assistant.
+Follow the instruction below and give the best possible answer.
+
+Instruction:
+{}
+[/INST]"""
 
 # Load model
 model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH).half().eval().to(device)
