@@ -47,12 +47,12 @@ def run_vicuna(prompt):
     )
     decoded = tokenizer.decode(output[0], skip_special_tokens=True)
 
-    # 2. Tách phần Assistant:
-    if "Assistant:" in decoded:
-        decoded = decoded.split("Assistant:")[-1].strip()
-    
+    # 2. Tách phần ASSISTANT:
+    if "ASSISTANT:" in decoded:
+        decoded = decoded.split("ASSISTANT:")[-1].strip()
+        
     # 3. Nối câu bắt buộc boxed để model infer tiếp
-    followup_prompt = decoded + "\nSo the rank 1 model is \\boxed{Model "
+    followup_prompt = decoded + "\nSo the lower rank model is \\boxed{Model "
 
     # 4. Infer tiếp
     model_inputs2 = tokenizer(followup_prompt, return_tensors="pt", truncation=True, max_length=5000).to(device)

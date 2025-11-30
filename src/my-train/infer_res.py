@@ -2,17 +2,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 import json
 import torch
-from config import MODEL_CACHE_PATH
+from config import MODEL_CACHE_PATH, prompt_template_vicuna
 
 device = 'cuda:0'
 model_name = "lmsys/vicuna-7b-v1.3"
-prompt_template = """[INST]
-You are a helpful and concise assistant.
-Follow the instruction below and give the best possible answer.
-
-Instruction:
-{}
-[/INST]"""
 
 # Load model
 model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH).half().eval().to(device)
@@ -33,21 +26,7 @@ with torch.no_grad():
     with open(output_jsonl, 'w', encoding='utf-8') as f_out:
         for item in tqdm(data, desc="Inferring prompts"):
             # ---- Gốc prompt ----
-            input_text = prompt_template.format(item['prompt'].strip())
-            model_inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
-            output = model.generate(
-                **model_inputs,
-                max_new_tokens=2048,
-                do_sample=True,
-                top_p=1.0,
-                temperature=0.7,
-                num_beams=1,
-                )
-            decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
-            item['res'] = decoded[0].split('[/INST]')[1].strip() if '[/INST]' in decoded[0] else decoded[0]
-
-            # ---- Optimized prompt ----
-            input_text = prompt_template.format(item['optimized_prompt'].strip())
+            input_text = prompt_template_vicuna.format(item['prompt'].strip())
             model_inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
             output = model.generate(
                 **model_inputs,
@@ -58,7 +37,21 @@ with torch.no_grad():
                 num_beams=1,
             )
             decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
-            item['optimized_res'] = decoded[0].split('[/INST]')[1].strip() if '[/INST]' in decoded[0] else decoded[0]
+            item['res'] = decoded[0].split('ASSISTANT:')[1].strip()
+
+            # ---- Optimized prompt ----
+            input_text = prompt_template_vicuna.format(item['optimized_prompt'].strip())
+            model_inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
+            output = model.generate(
+                **model_inputs,
+                max_new_tokens=2048,
+                do_sample=True,
+                top_p=1.0,
+                temperature=0.7,
+                num_beams=1,
+            )
+            decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
+            item['optimized_res'] = decoded[0].split('ASSISTANT:')[1].strip()
 
             # ---- Ghi 1 dòng JSONL
             f_out.write(json.dumps(item, ensure_ascii=False) + "\n")

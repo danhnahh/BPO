@@ -2,9 +2,9 @@ import json
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from config import MODEL_CACHE_PATH
 from tqdm import tqdm  # <-- import tqdm
+from config import prompt_template_vicuna
 
 model_path = 'THUDM/BPO'
-prompt_template = "[INST] You are an expert prompt engineer. Please help me improve this prompt to get a more helpful and harmless response:\n{} [/INST]"
 
 input_jsonl = "testset/vicuna_eval.jsonl"
 output_jsonl = "optimized_prompts.jsonl"
@@ -30,7 +30,7 @@ with open(input_jsonl, "r", encoding="utf-8") as f:
 with open(output_jsonl, "w", encoding="utf-8") as f_out:
     for item in tqdm(data, desc="Inferring prompts"):
         text = item["text"]
-        prompt = prompt_template.format(text)
+        prompt = prompt_template_vicuna.format(text)
         
         # Tokenize & move to device
         model_inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
