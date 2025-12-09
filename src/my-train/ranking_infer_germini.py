@@ -1,73 +1,62 @@
 import re
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from google import genai
 from tqdm import tqdm
 import json
-import torch
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from config import MODEL_CACHE_PATH
-from string import Template
 
 device = 'cuda:0'
-model_name = "google/gemma-2-9b"
-
-class SafeDict(dict):
-    def __missing__(self, key):
-        # Nếu key không có trong dict, giữ nguyên trong template
-        return "{" + key + "}"
-
-# ==== ĐỌC PROMPT TEMPLATE TỪ FILE ====
-with open("ranking_prompt.txt", "r", encoding="utf-8") as f:
-    raw_prompt = f.read()
+model_name = "lmsys/vicuna-7b-v1.3"
 
 # ==== LOAD MODEL ====
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    cache_dir=MODEL_CACHE_PATH,
-    torch_dtype=torch.bfloat16
-).eval().to(device)
+    cache_dir=MODEL_CACHE_PATH
+).half().eval().to(device)
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH)
+tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH, legacy=False)
 
-input_jsonl = "optimized_prompts_llama2_7b_res.jsonl"
-output_jsonl = "lose_pairwise_results.jsonl"
+API_KEY = "api_key"
+client = genai.Client(api_key=API_KEY)
 
-# Dùng Template để replace chỉ {instruction}, {output_1}, {output_2}
+# ==== Đọc prompt template ====
+with open("ranking_prompt.txt", "r", encoding="utf-8") as f:
+    raw_prompt = f.read()
+
 def fill_prompt(instruction, output_1, output_2):
-    prompt = raw_prompt
-    prompt = prompt.replace('""{instruction}""', instruction)
+    prompt = raw_prompt.replace('""{instruction}""', instruction)
     prompt = prompt.replace('""{output_1}""', output_1)
     prompt = prompt.replace('""{output_2}""', output_2)
     return prompt
 
-def run_eval_model(prompt):
-    # 1. Infer lần 1
-    model_inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=5000).to(device)
-    input_len = model_inputs["input_ids"].shape[1]
-    output = model.generate(
-        **model_inputs,
-        max_new_tokens=1024,
-        do_sample=False
+def run_vicuna_with_gemini(prompt):
+    """
+    prompt: text đã fill template {instruction}, {output_1}, {output_2}
+    
+    Trả về final output của Vicuna, dựa trên model rank thấp hơn do Gemini xác định
+    """
+    # ==== 1. Gọi Gemini để xác định model rank thấp hơn ====
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
     )
+    decoded_gemini = response.text.strip()
 
-    # 3. Tách phần mới sinh (bỏ prompt)
-    generated_ids = output[0][input_len:]  # chỉ lấy token sinh ra sau prompt
-    decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
-    # 3. Nối câu bắt buộc boxed để model infer tiếp
-    followup_prompt = decoded + "\nSo the model has rank 1 is \\boxed{Model "
+    # ==== 2. Tạo follow-up prompt cho Vicuna ====
+    followup_prompt = decoded_gemini + "\nSo the lower rank model is \\boxed{Model "
 
-    # 4. Infer tiếp
+    # ==== 3. Infer tiếp với Vicuna ====
     model_inputs2 = tokenizer(followup_prompt, return_tensors="pt", truncation=True, max_length=5000).to(device)
     output2 = model.generate(
         **model_inputs2,
-        max_new_tokens=50,  # đủ để điền tên model
+        max_new_tokens=50,  # đủ để điền tên model hoặc giải thích
         do_sample=False
     )
     decoded2 = tokenizer.decode(output2[0], skip_special_tokens=True)
 
-    # 5. Lấy phần model sinh thêm và đóng dấu }
+    # ==== 4. Kết hợp output ====
     final_output = followup_prompt + decoded2[len(followup_prompt):].strip()
-
-    # print(final_output)
 
     return final_output
 
@@ -87,8 +76,11 @@ def extract_winner(text):
         elif '2' in content:
             return 1
     return None
-    
+
 # ==== READ INPUT ====
+input_jsonl = "optimized_prompts_llama2_7b_res.jsonl"
+output_jsonl = "lose_pairwise_results.jsonl"
+
 rows = []
 with open(input_jsonl, "r", encoding="utf-8") as f:
     for line in f:
@@ -106,44 +98,39 @@ with open(output_jsonl, "w", encoding="utf-8") as f_out:
         instruction = item["prompt"]
         output_1 = item["res"]
         output_2 = item["optimized_res"]
+
         if output_1 == output_2:
             winner = 2
         else:
-            # === APPLY TEMPLATE ===
             prompt = fill_prompt(
                 instruction=instruction,
                 output_1=output_1,
                 output_2=output_2
             )
 
-            result_text = run_eval_model(prompt)
-            winner = extract_winner(result_text)
+            response = run_vicuna_with_gemini(prompt)
+            winner = extract_winner(response)
 
-        # Chỉ ghi các trường hợp 0 thua 1
-        if winner == 1:
-            total_1 += 1
+        if winner == 0:
+            total_0 += 1
             item["winner"] = winner
             f_out.write(json.dumps(item, ensure_ascii=False) + "\n")
-        elif winner == 0:
-            total_0 += 1
-            # Không ghi item thua
-            pass
+        elif winner == 1:
+            total_1 += 1
         elif winner == 2:
             total_2 += 1
         else:
-            print(result_text)
+            print("Cannot parse winner:", response)
 
     # ==== WRITE SUMMARY ====
-
     summary = {
-        "optimized_win": total_0,    # 0 là optimized thắng
-        "original_win": total_1,     # 1 là original thắng
-        "draw": total_2              # cả hai == -1
+        "optimized_win": total_0,
+        "original_win": total_1,
+        "draw": total_2
     }
     f_out.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
     total_all = total_0 + total_1 + total_2
-
     summary_percent = {
         "optimized_win_percent": total_0 / total_all * 100,
         "original_win_percent": total_1 / total_all * 100,

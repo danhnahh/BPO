@@ -5,11 +5,11 @@ import torch
 from config import MODEL_CACHE_PATH, prompt_template_vicuna
 
 device = 'cuda:0'
-model_name = "lmsys/vicuna-7b-v1.3"
+model_name = "google/gemma-2-9b"
 
 # Load model
-model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH).half().eval().to(device)
-tokenizer = AutoTokenizer.from_pretrained(model_name, legacy=False)
+model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH, torch_dtype=torch.bfloat16, device=device).eval()
+tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH)
 
 # Input & output JSONL
 input_jsonl = "optimized_prompts.jsonl"
