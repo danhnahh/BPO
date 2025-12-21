@@ -4,16 +4,17 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer, util
-from utils import make_prompt_template
+from utils import generate_batch
 
 from config import (
     MODEL_CACHE_PATH,
-    prompt_template_optimize
+    prompt_template_optimize,
+    prompt_template_vicuna
 )
 
 # ============ CONFIG ============
 device = "cuda:0"
-input_jsonl = "testset/vicuna_eval.jsonl"
+input_jsonl = "optimized_prompts.jsonl"
 tmp_step1 = "tmp_step1_r0.jsonl"
 tmp_step2 = "tmp_step2_r0.jsonl"
 output_jsonl = "responses_with_semantic.jsonl"
@@ -23,29 +24,7 @@ M = 10
 # -----------------------------------------------------
 # Helper: generate text
 # -----------------------------------------------------
-def generate(model, tokenizer, prompt, max_new_tokens=1024, apply_chat_template=True, **kwargs):
-    if apply_chat_template:
-        prompt = make_prompt_template(prompt)
-        prompt = tokenizer.apply_chat_template(prompt, tokenize=False)
-    # Encode input
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
-    input_ids = inputs["input_ids"]
 
-    # Generate
-    out = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        **kwargs
-    )
-
-    # Lấy phần sinh thêm
-    generated_ids = out[0][len(input_ids[0]):]
-
-    # Decode chỉ phần mới
-    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-    return text.strip()
 
 # -----------------------------------------------------
 # STEP 1: Generate paraphrase prompts using BPO 
@@ -59,7 +38,7 @@ def step1_generate_paraphrase():
     ).eval().to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        optimize_path, cache_dir=MODEL_CACHE_PATH, use_fast=False
+        optimize_path, cache_dir=MODEL_CACHE_PATH, use_fast=False, legacy=True
     )
     model.config.return_dict = True
 
@@ -68,18 +47,18 @@ def step1_generate_paraphrase():
 
         for line in tqdm(fin, desc="Step1"):
             item = json.loads(line)
-            prompt = item["text"]
+            prompt = item["prompt"]
 
-            # Sinh M paraphrases
-            paraphrases = [
-                generate(
-                    model, tokenizer,
-                    prompt_template_optimize.format(prompt),
-                    temperature=1.0,
-                    apply_chat_template=False
-                )
-                for _ in range(M)
-            ]
+            # Sinh M paraphrases (batch)
+            batch_prompts = [prompt_template_optimize.format(prompt) for _ in range(M)]
+            paraphrases = generate_batch(
+                model, tokenizer,
+                batch_prompts,
+                temperature=1.0,
+                top_p=0.9,
+                apply_chat_template=False,
+                device=device
+            )
 
             fout.write(json.dumps({
                 "prompt": prompt,
@@ -105,7 +84,7 @@ def step2_infer_vicuna(device="cuda:0"):
     model = AutoModelForCausalLM.from_pretrained(
         infer_model_path,
         cache_dir=MODEL_CACHE_PATH,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float16
     ).eval().to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -113,6 +92,8 @@ def step2_infer_vicuna(device="cuda:0"):
         cache_dir=MODEL_CACHE_PATH,
         legacy=False
     )
+
+    batch_size = 6  # Điều chỉnh tùy theo VRAM
 
     # File input/output
     with open(tmp_step1, "r", encoding="utf-8") as fin, \
@@ -123,32 +104,44 @@ def step2_infer_vicuna(device="cuda:0"):
             prompt = item["prompt"]
             paraphrases = item["paraphrase_prompts"]
 
-            # === 1) Infer original prompt ===
-            full_prompt_orig = prompt.strip()
-            response_original = generate(
-                model,
-                tokenizer,
-                full_prompt_orig,
-                max_new_tokens=2048,
-                temperature=0.7,
-                top_p=1.0,
-                num_beams=1
-            )
+            # === 1) Lọc các prompt unique (bao gồm cả original) ===
+            all_prompts = [prompt.strip()] + [p.strip() for p in paraphrases]
 
-            # === 2) Infer paraphrases ===
-            paraphrase_responses = []
-            for p in paraphrases:
-                full_prompt = p.strip()
-                resp = generate(
+            # Tạo mapping: unique_prompt -> index đầu tiên xuất hiện
+            unique_prompts = []
+            prompt_to_idx = {}  # prompt -> index trong unique_prompts
+            original_to_unique = []  # index trong all_prompts -> index trong unique_prompts
+
+            for p in all_prompts:
+                if p not in prompt_to_idx:
+                    prompt_to_idx[p] = len(unique_prompts)
+                    unique_prompts.append(p)
+                original_to_unique.append(prompt_to_idx[p])
+
+            # === 2) Infer chỉ các prompt unique ===
+            unique_responses = []
+            for batch_start in range(0, len(unique_prompts), batch_size):
+                batch = unique_prompts[batch_start:batch_start + batch_size]
+
+                batch_responses = generate_batch(
                     model,
                     tokenizer,
-                    full_prompt,
+                    batch,
                     max_new_tokens=2048,
                     temperature=0.7,
                     top_p=1.0,
-                    num_beams=1
+                    apply_chat_template=True,
+                    device=device
                 )
-                paraphrase_responses.append(resp)
+                unique_responses.extend(batch_responses)
+                torch.cuda.empty_cache()
+
+            # === 3) Map lại response cho tất cả prompts (bao gồm trùng) ===
+            all_responses = [unique_responses[original_to_unique[i]] for i in range(len(all_prompts))]
+
+            # Tách response_original và paraphrase_responses
+            response_original = all_responses[0]
+            paraphrase_responses = all_responses[1:]
 
             # === Lưu output STEP 2 ===
             fout.write(json.dumps({
@@ -166,17 +159,17 @@ def step2_infer_vicuna(device="cuda:0"):
 # -----------------------------------------------------
 # STEP 3: SBERT clustering + semantic entropy 
 # -----------------------------------------------------
-def step3_sbert_clustering(device='cuda:0', threshold=0.8):
+def step3_sbert_clustering(device='cuda:0', threshold=0.9):
     print("===== STEP 3: SBERT clustering + semantic entropy =====")
 
     sbert = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device=device, cache_folder=MODEL_CACHE_PATH)
 
     with open(tmp_step2, "r", encoding="utf-8") as fin, \
-         open(output_jsonl, "w", encoding="utf-8") as fout:
+        open(output_jsonl, "w", encoding="utf-8") as fout:
 
         for line in tqdm(fin):
             item = json.loads(line)
-            samples = item["paraphrase_responses"]  # dùng trực tiếp từ STEP 2
+            samples = item["paraphrase_prompts"]
 
             # Encode tất cả các câu
             embeddings = sbert.encode(samples, convert_to_tensor=True)
@@ -199,33 +192,63 @@ def step3_sbert_clustering(device='cuda:0', threshold=0.8):
                         used.add(j)
                 clusters.append(cluster)
 
+            # ====== 🔥 Chọn đại diện cho mỗi cluster ======
+            cluster_representatives = []
+
+            for cluster in clusters:
+                # Nếu cụm có 1 phần tử → chính nó là đại diện
+                if len(cluster) == 1:
+                    cluster_representatives.append(cluster[0])
+                    continue
+
+                # Lấy embedding của cluster
+                cluster_embeds = torch.stack([embeddings[i] for i in cluster])
+
+                # Tính centroid (mean vector)
+                centroid = cluster_embeds.mean(dim=0, keepdim=True)
+
+                # Tính cosine similarity giữa centroid và từng embedding trong cluster
+                sims = util.pytorch_cos_sim(centroid, cluster_embeds)[0]
+
+                # Chọn index trong cluster gần centroid nhất (cosine sim cao nhất)
+                best_local_idx = torch.argmax(sims).item()
+
+                # Map lại index này về index trong samples
+                best_idx = cluster[best_local_idx]
+
+                # Thêm representative
+                cluster_representatives.append(best_idx)
+
             # Cluster probabilities
             cluster_probs = [len(c)/len(samples) for c in clusters]
 
             # Semantic entropy
             entropy = -sum(p * (math.log(p) if p > 0 else 0) for p in cluster_probs)
 
-            # Sau khi tính cluster_probs và entropy
+            # Confidence score
             K = len(clusters)
             conf_score = 1 - (entropy / math.log(K)) if K > 1 else 1.0
 
+            # ==== Ghi ra JSONL có thêm cluster_representatives ====
             fout.write(json.dumps({
                 "prompt": item["prompt"],
                 "response_original": item["response_original"],
-                "samples": samples,
+                "paraphrase_responses": item["paraphrase_responses"],
+                "paraphrase_prompts": item["paraphrase_prompts"],
                 "clusters": clusters,
+                "cluster_representatives": cluster_representatives,
                 "cluster_probs": cluster_probs,
                 "semantic_entropy": entropy,
                 "conf_score": conf_score
             }, ensure_ascii=False) + "\n")
 
-    print("✓ Done STEP 3 (SBERT)")
+        print("✓ Done STEP 3 (SBERT)")
 
 # -----------------------------------------------------
 # RUN ALL STEPS
 # -----------------------------------------------------
 if __name__ == "__main__":
     # step1_generate_paraphrase()
-    step2_infer_vicuna()
+    # step2_infer_vicuna()
     step3_sbert_clustering()
     print("\n🎉 ALL DONE!")

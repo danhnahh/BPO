@@ -1,15 +1,18 @@
 import json
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from config import MODEL_CACHE_PATH
-from tqdm import tqdm  # <-- import tqdm
-from config import prompt_template_vicuna
+from tqdm import tqdm
+from config import prompt_template_optimize
+from utils import generate_batch
 
 model_path = 'THUDM/BPO'
 
-input_jsonl = "testset/vicuna_eval.jsonl"
+input_jsonl = "testset/dolly_eval.json"
 output_jsonl = "optimized_prompts.jsonl"
 
 device = 'cuda:0'
+batch_size = 10  # Điều chỉnh tùy theo VRAM
 
 # Load model & tokenizer
 model = AutoModelForCausalLM.from_pretrained(model_path, cache_dir=MODEL_CACHE_PATH).half().eval().to(device)
@@ -23,37 +26,40 @@ if tokenizer.pad_token_id is None:
 # ---- READ INPUT ----
 data = []
 with open(input_jsonl, "r", encoding="utf-8") as f:
-    for line in f:
-        data.append(json.loads(line))
+    # for line in f:
+        data = json.load(f)
 
-# ---- INFER TỪNG PROMPT VỚI TQDM ----
+# ---- INFER BATCH VỚI TQDM ----
 with open(output_jsonl, "w", encoding="utf-8") as f_out:
-    for item in tqdm(data, desc="Inferring prompts"):
-        text = item["text"]
-        prompt = prompt_template_vicuna.format(text)
-        
-        # Tokenize & move to device
-        model_inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    for batch_start in tqdm(range(0, len(data), batch_size), desc="Inferring batches"):
+        batch_data = data[batch_start:batch_start + batch_size]
 
-        # Generate
-        output = model.generate(
-            **model_inputs,
+        # Chuẩn bị batch prompts
+        texts = [item["instruction"] for item in batch_data]
+        prompts = [prompt_template_optimize.format(text) for text in texts]
+
+        # Generate batch
+        outputs = generate_batch(
+            model,
+            tokenizer,
+            prompts,
             max_new_tokens=1024,
             do_sample=True,
             top_p=0.9,
             temperature=0.6,
-            num_beams=1,
+            apply_chat_template=False,
+            device=device
         )
 
-        # Decode
-        decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
-        resp = decoded[0].split('[/INST]')[1].strip() if '[/INST]' in decoded[0] else decoded[0]
+        # Save từng kết quả
+        for text, output in zip(texts, outputs):
+            out = {
+                "prompt": text,
+                "optimized_prompt": output
+            }
+            f_out.write(json.dumps(out, ensure_ascii=False) + "\n")
 
-        # Save
-        out = {
-            "prompt": text,
-            "optimized_prompt": resp
-        }
-        f_out.write(json.dumps(out, ensure_ascii=False) + "\n")
+        # Clear cache giữa các batch
+        torch.cuda.empty_cache()
 
 print("Done! Saved to:", output_jsonl)

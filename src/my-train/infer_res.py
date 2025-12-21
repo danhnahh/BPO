@@ -3,17 +3,19 @@ from tqdm import tqdm
 import json
 import torch
 from config import MODEL_CACHE_PATH, prompt_template_vicuna
+from utils import generate_batch
 
 device = 'cuda:0'
-model_name = "google/gemma-2-9b"
+model_name = "meta-llama/Llama-2-7b-chat-hf"
+batch_size = 8  # Điều chỉnh tùy theo VRAM
 
 # Load model
-model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH, torch_dtype=torch.bfloat16, device=device).eval()
-tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH)
+model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH, torch_dtype=torch.bfloat16, device_map="auto").eval()
+tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH, legacy=False)
 
 # Input & output JSONL
 input_jsonl = "optimized_prompts.jsonl"
-output_jsonl = "optimized_prompts_llama2_7b_res.jsonl"
+output_jsonl = "optimized_prompts_llama2_7b_res-original.jsonl"
 
 # ---- READ JSONL ----
 data = []
@@ -21,39 +23,34 @@ with open(input_jsonl, 'r', encoding='utf-8') as f:
     for line in f:
         data.append(json.loads(line))
 
-# ---- INFER ----
+# ---- INFER BATCH ----
 with torch.no_grad():
     with open(output_jsonl, 'w', encoding='utf-8') as f_out:
-        for item in tqdm(data, desc="Inferring prompts"):
-            # ---- Gốc prompt ----
-            input_text = prompt_template_vicuna.format(item['prompt'].strip())
-            model_inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
-            output = model.generate(
-                **model_inputs,
-                max_new_tokens=2048,
-                do_sample=True,
-                top_p=1.0,
-                temperature=0.7,
-                num_beams=1,
-            )
-            decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
-            item['res'] = decoded[0].split('ASSISTANT:')[1].strip()
+        for batch_start in tqdm(range(0, len(data), batch_size), desc="Inferring batches"):
+            batch_data = data[batch_start:batch_start + batch_size]
 
-            # ---- Optimized prompt ----
-            input_text = prompt_template_vicuna.format(item['optimized_prompt'].strip())
-            model_inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
-            output = model.generate(
-                **model_inputs,
-                max_new_tokens=2048,
-                do_sample=True,
-                top_p=1.0,
-                temperature=0.7,
-                num_beams=1,
-            )
-            decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
-            item['optimized_res'] = decoded[0].split('ASSISTANT:')[1].strip()
+            # Chuẩn bị batch prompts
+            # prompts = [prompt_template_vicuna.format(item['optimized_prompt']) for item in batch_data]
+            prompts = [item['optimized_prompt'] for item in batch_data]
 
-            # ---- Ghi 1 dòng JSONL
-            f_out.write(json.dumps(item, ensure_ascii=False) + "\n")
+            # Generate batch
+            outputs = generate_batch(
+                model,
+                tokenizer,
+                prompts,
+                max_new_tokens=2048,
+                temperature=0.7,
+                top_p=1.0,
+                apply_chat_template=True,
+                device=device
+            )
+
+            # Ghi từng kết quả
+            for item, optimized_res in zip(batch_data, outputs):
+                item['optimized_res'] = optimized_res
+                f_out.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+            # Clear cache giữa các batch
+            torch.cuda.empty_cache()
 
 print("Done! Saved to:", output_jsonl)

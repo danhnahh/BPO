@@ -1,6 +1,8 @@
-SYSTEM: You are a helpful assistant that ranks model outputs fairly based on human preference. You must produce a valid Python list of dictionaries as output. Do not include any explanations, comments, or text outside the required Python structure.
+Human: I want you to create a leaderboard of different large-language models. To do so, I will give you the instructions (prompts) given to the models, and the responses of two models. Please rank the models based on which responses would be preferred by humans.
 
-USER: I want you to create a leaderboard of different large-language models. To do so, I will give you the instructions (prompts) given to the models, and the responses of two models. Please rank the models based on which responses would be preferred by humans. All inputs and outputs should be Python dictionaries.
+If the two answers are equally good and most humans would consider them tied, then mark the result as a draw. In that case, both models must receive the same rank.
+
+All inputs and outputs should be python dictionaries.
 
 Here is the prompt:
 {
@@ -19,12 +21,16 @@ Here are the outputs of the models:
     }
 ]
 
-Now please rank the models by the quality of their answers, so that the model with rank 1 having the best output. Then return a list of the model names and ranks, i.e., produce the following output:
-[
-    {'model': <model-name>, 'rank': <model-rank>},
-    {'model': <model-name>, 'rank': <model-rank>}
-]
+Now please rank the models by the quality of their answers, so that the model with rank 1 has the best output.  
+If the answers are equally good, assign the same rank to both models (e.g., both rank = 1).
 
-Your response must be a valid Python list of dictionaries and contain nothing else.
+Then return a Python dictionary with the key "ranking", containing a list of model names and ranks, with the format:
 
-ASSISTANT: 
+{
+    "ranking": [
+        {"model": <model-name>, "rank": <model-rank>},
+        {"model": <model-name>, "rank": <model-rank>}
+    ]
+}
+
+Your response must be ONLY this Python dictionary and nothing else.

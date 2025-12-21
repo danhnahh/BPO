@@ -1,145 +1,68 @@
-import re
+import torch
 from google import genai
-from tqdm import tqdm
-import json
-
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from config import MODEL_CACHE_PATH
+from ranking_utils import (
+    load_ranking_prompt,
+    read_jsonl,
+    run_ranking_loop,
+    run_followup_inference
+)
 
 device = 'cuda:0'
-model_name = "lmsys/vicuna-7b-v1.3"
+model_name = "meta-llama/Llama-2-7b-chat-hf"
 
-# ==== LOAD MODEL ====
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    cache_dir=MODEL_CACHE_PATH
-).half().eval().to(device)
-
-tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH, legacy=False)
-
-API_KEY = "api_key"
-client = genai.Client(api_key=API_KEY)
-
-# ==== Đọc prompt template ====
-with open("ranking_prompt.txt", "r", encoding="utf-8") as f:
-    raw_prompt = f.read()
-
-def fill_prompt(instruction, output_1, output_2):
-    prompt = raw_prompt.replace('""{instruction}""', instruction)
-    prompt = prompt.replace('""{output_1}""', output_1)
-    prompt = prompt.replace('""{output_2}""', output_2)
-    return prompt
-
-def run_vicuna_with_gemini(prompt):
-    """
-    prompt: text đã fill template {instruction}, {output_1}, {output_2}
-    
-    Trả về final output của Vicuna, dựa trên model rank thấp hơn do Gemini xác định
-    """
-    # ==== 1. Gọi Gemini để xác định model rank thấp hơn ====
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
-    decoded_gemini = response.text.strip()
-
-    # ==== 2. Tạo follow-up prompt cho Vicuna ====
-    followup_prompt = decoded_gemini + "\nSo the lower rank model is \\boxed{Model "
-
-    # ==== 3. Infer tiếp với Vicuna ====
-    model_inputs2 = tokenizer(followup_prompt, return_tensors="pt", truncation=True, max_length=5000).to(device)
-    output2 = model.generate(
-        **model_inputs2,
-        max_new_tokens=50,  # đủ để điền tên model hoặc giải thích
-        do_sample=False
-    )
-    decoded2 = tokenizer.decode(output2[0], skip_special_tokens=True)
-
-    # ==== 4. Kết hợp output ====
-    final_output = followup_prompt + decoded2[len(followup_prompt):].strip()
-
-    return final_output
-
-def extract_winner(text):
-    """
-    Tìm \boxed{…} đầu tiên trong text, xem có số 1 hay 2 bên trong.
-    Trả về:
-        0 nếu có số 1
-        1 nếu có số 2
-        None nếu không tìm thấy
-    """
-    m = re.search(r'\\boxed\{([^}]*)\}', text)
-    if m:
-        content = m.group(1)
-        if '1' in content:
-            return 0
-        elif '2' in content:
-            return 1
-    return None
-
-# ==== READ INPUT ====
 input_jsonl = "optimized_prompts_llama2_7b_res.jsonl"
 output_jsonl = "lose_pairwise_results.jsonl"
 
-rows = []
-with open(input_jsonl, "r", encoding="utf-8") as f:
-    for line in f:
-        rows.append(json.loads(line))
+# ==== LOAD MODEL (for followup inference) ====
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    cache_dir=MODEL_CACHE_PATH,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+).eval()
 
-total_0 = 0
-total_1 = 0
-total_2 = 0
+tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_PATH)
+
+# ==== GEMINI CLIENT ====
+API_KEY = "api-key"
+client = genai.Client(api_key=API_KEY)
+
+# ==== LOAD PROMPT TEMPLATE ====
+raw_prompt = load_ranking_prompt()
+
+# ==== EVAL FUNCTION (Gemini + local model) ====
+def run_with_gemini(prompt):
+    """
+    Gọi Gemini để lấy reasoning, sau đó dùng local model để extract boxed answer
+    """
+    # 1. Gọi Gemini để xác định model rank
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-lite",
+        contents=prompt,
+    )
+    reasoning = response.text.strip()
+
+    # 2. Dùng hàm chung để extract boxed answer
+    return run_followup_inference(reasoning, model, tokenizer, device)
 
 # ==== RUN ====
-with open(output_jsonl, "w", encoding="utf-8") as f_out:
+if __name__ == "__main__":
+    rows = read_jsonl(input_jsonl)
 
-    for item in tqdm(rows, desc="Ranking pairs"):
-
-        instruction = item["prompt"]
-        output_1 = item["res"]
-        output_2 = item["optimized_res"]
-
-        if output_1 == output_2:
-            winner = 2
-        else:
-            prompt = fill_prompt(
-                instruction=instruction,
-                output_1=output_1,
-                output_2=output_2
-            )
-
-            response = run_vicuna_with_gemini(prompt)
-            winner = extract_winner(response)
-
-        if winner == 0:
-            total_0 += 1
-            item["winner"] = winner
-            f_out.write(json.dumps(item, ensure_ascii=False) + "\n")
-        elif winner == 1:
-            total_1 += 1
-        elif winner == 2:
-            total_2 += 1
-        else:
-            print("Cannot parse winner:", response)
-
-    # ==== WRITE SUMMARY ====
-    summary = {
-        "optimized_win": total_0,
-        "original_win": total_1,
-        "draw": total_2
-    }
-    f_out.write(json.dumps(summary, ensure_ascii=False) + "\n")
-
-    total_all = total_0 + total_1 + total_2
-    summary_percent = {
-        "optimized_win_percent": total_0 / total_all * 100,
-        "original_win_percent": total_1 / total_all * 100,
-        "draw_percent": total_2 / total_all * 100
-    }
-    f_out.write(json.dumps(summary_percent, ensure_ascii=False) + "\n")
-
-print("DONE! Saved to:", output_jsonl)
-print(f"Optimized win    : {total_0}")
-print(f"Original win     : {total_1}")
-print(f"Draw (both = -1) : {total_2}")
-print(f"Total            : {total_all}")
+    run_ranking_loop(
+        rows=rows,
+        eval_fn=run_with_gemini,
+        raw_prompt=raw_prompt,
+        output_jsonl=output_jsonl,
+        get_instruction_fn=lambda item: item["prompt"],
+        get_optimized_instruction_fn=lambda item: item["optimized_prompt"],
+        get_output_1_fn=lambda item: item["optimized_res"],
+        get_output_2_fn=lambda item: item["res"],
+        label_0="optimized_win",
+        label_1="original_win",
+        label_2="draw",
+        save_winner_0=False,
+        save_winner_1=True,
+    )
