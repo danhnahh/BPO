@@ -88,3 +88,23 @@ def generate_batch(model, tokenizer, prompts, max_new_tokens=1024, apply_chat_te
         results.append(text.strip())
 
     return results
+
+import torch
+import torch.nn.functional as F
+
+def spherical_mean(embeddings: torch.Tensor, eps: float = 1e-8):
+    """
+    embeddings: Tensor (n, d), CHƯA hoặc ĐÃ normalize đều được
+    return: centroid (d,), L2-normalized
+
+    Dùng cho cosine similarity / spherical k-means
+    """
+    # Normalize từng vector
+    X = F.normalize(embeddings, dim=1, eps=eps)
+
+    # Tổng vector
+    s = X.sum(dim=0)
+
+    # Normalize lại centroid
+    centroid = F.normalize(s, dim=0, eps=eps)
+    return centroid

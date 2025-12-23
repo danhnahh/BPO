@@ -3,6 +3,7 @@ import torch
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer, util
 from config import MODEL_CACHE_PATH
+from utils import spherical_mean
 
 # === CONFIG ===
 device = 'cuda:0'
@@ -72,10 +73,10 @@ def get_optimized_response(sem_item, threshold=0.1):
     rep_embs = sbert.encode([paraphrase_responses[i] for i in reps], convert_to_tensor=True)
 
     # Tính centroid (mean embedding)
-    centroid = rep_embs.mean(dim=0, keepdim=True)  # shape (1, d)
+    centroid = spherical_mean(rep_embs)  # shape (d)
 
     # Tính similarity giữa centroid và từng representative
-    sims = util.pytorch_cos_sim(centroid, rep_embs)[0]  # shape (n,)
+    sims = util.pytorch_cos_sim(centroid, rep_embs)  # shape (n,)
 
     # Chọn representative gần centroid nhất
     best_idx = torch.argmax(sims).item()

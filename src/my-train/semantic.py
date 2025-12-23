@@ -4,7 +4,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer, util
-from utils import generate_batch
+from utils import generate_batch, spherical_mean
 
 from config import (
     MODEL_CACHE_PATH,
@@ -205,10 +205,10 @@ def step3_sbert_clustering(device='cuda:0', threshold=0.9):
                 cluster_embeds = torch.stack([embeddings[i] for i in cluster])
 
                 # Tính centroid (mean vector)
-                centroid = cluster_embeds.mean(dim=0, keepdim=True)
+                centroid = spherical_mean(cluster_embeds)
 
                 # Tính cosine similarity giữa centroid và từng embedding trong cluster
-                sims = util.pytorch_cos_sim(centroid, cluster_embeds)[0]
+                sims = util.pytorch_cos_sim(centroid, cluster_embeds)
 
                 # Chọn index trong cluster gần centroid nhất (cosine sim cao nhất)
                 best_local_idx = torch.argmax(sims).item()
